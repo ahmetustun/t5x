@@ -49,11 +49,11 @@ setuptools.setup(
         'absl-py',
         'cached_property',
         'clu @ git+https://github.com/google/CommonLoopUtils#egg=clu',
-        'flax @ git+https://github.com/google/flax#egg=flax',
+        'flax==0.6.11',
         'fiddle >= 0.2.5',
         'gin-config',
-        f'jax >= {_jax_version}',
-        f'jaxlib >= {_jaxlib_version}',
+        f'jax=={_jax_version}',
+        f'jaxlib== {_jaxlib_version}',
         (
             'jestimator @'
             ' git+https://github.com/google-research/jestimator#egg=jestimator'
@@ -78,7 +78,7 @@ setuptools.setup(
         ],
         'test': ['pytest', 't5'],
         # Cloud TPU requirements.
-        'tpu': [f'jax[tpu] >= {_jax_version}'],
+        'tpu': [f'jax[tpu]=={_jax_version}'],
         'gpu': [
             'ipdb==0.13.9',
             'fasttext==0.9.2',
