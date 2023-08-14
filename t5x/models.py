@@ -21,7 +21,7 @@ steps.
 
 import abc
 import functools
-from typing import Any, Callable, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Tuple, Union
 
 import clu.metrics as clu_metrics
 from flax import core as flax_core
@@ -29,6 +29,7 @@ from flax import linen as nn
 from flax.core import scope as flax_scope
 from flax.linen import partitioning as flax_partitioning
 from flax.training import common_utils
+from flax import traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1420,3 +1421,165 @@ def get_input_vocabulary(model: BaseTransformerModel) -> seqio.Vocabulary:
 
 def get_output_vocabulary(model: BaseTransformerModel) -> seqio.Vocabulary:
   return model.output_vocabulary
+
+
+MOE_METRICS = ['auxiliary_loss']
+
+class MoeEncoderDecoderModel(EncoderDecoderModel):
+    """Encoder-decoder subclass which propagates MoE auxiliary loss & metrics."""
+
+    def __init__(
+        self,
+        module: nn.Module,
+        input_vocabulary: seqio.Vocabulary,
+        output_vocabulary: seqio.Vocabulary,
+        optimizer_def: optimizers.OptimizerDefType,
+        decode_fn: DecodeFnCallable = decoding.beam_search,
+        feature_converter_cls: Optional[Callable[..., seqio.FeatureConverter]] = None,
+        label_smoothing: float = 0.0,
+        z_loss: float = 0.0,
+        loss_normalizing_factor: Optional[float] = None,
+        aux_loss_factor: float = 0.,
+        task_id_loss_factor: float = 0.,
+        CR_loss_factor: float = 0.,
+    ):
+        super().__init__(module=module,
+                         input_vocabulary=input_vocabulary,
+                         output_vocabulary=output_vocabulary,
+                         optimizer_def=optimizer_def,
+                         decode_fn=decode_fn,
+                         feature_converter_cls=feature_converter_cls,
+                         label_smoothing=label_smoothing,
+                         z_loss=z_loss,
+                         loss_normalizing_factor=loss_normalizing_factor)
+        self._aux_loss_factor = aux_loss_factor
+        self._task_id_loss_factor = task_id_loss_factor
+        self._CR_loss_factor = CR_loss_factor
+
+    def loss_fn(
+        self,
+        params: PyTreeDef,
+        batch: Mapping[str, jnp.ndarray],
+        step_number: int,
+        dropout_rng: Optional[jnp.ndarray],
+    ) -> Tuple[jnp.ndarray, MetricsMap]:
+        """Cross-entropy loss function with auxiliary MoE losses.
+
+    Args:
+      params: Model parameters.
+      batch: Batch of training examples.
+      dropout_rng: Random number generator key for dropout.
+
+    Returns:
+      - Model loss.
+      - Metrics.
+    """
+
+        logits, state = self._compute_logits(params, batch, step_number, dropout_rng, mutable=['intermediates'])
+
+        return _moe_loss_fn(batch, logits, state, self._label_smoothing, self._z_loss, self._loss_normalizing_factor,
+                            self._aux_loss_factor, self._task_id_loss_factor, self._CR_loss_factor)
+
+
+def _moe_loss_fn(batch: Mapping[str, jnp.ndarray], logits: jnp.ndarray, state: flax_scope.FrozenVariableDict,
+                 label_smoothing: float, z_loss: float, loss_normalizing_factor: Optional[float],
+                 aux_loss_factor: float, task_id_loss_factor: float,
+                 CR_loss_factor: float) -> Tuple[jnp.ndarray, MetricsMap]:
+    """Computes combined cross-entropy and MoE auxiliary loss."""
+    loss_normalizing_factor: Optional[Union[float, int, str, losses.SpecialLossNormalizingFactor]]
+    (loss_normalizing_factor, weights) = losses.get_loss_normalizing_factor_and_weights(loss_normalizing_factor, batch)
+
+    targets = batch['decoder_target_tokens']
+    total_loss, z_loss, _ = losses.compute_weighted_cross_entropy(logits,
+                                                                  targets=targets,
+                                                                  weights=weights,
+                                                                  label_smoothing=label_smoothing,
+                                                                  z_loss=z_loss,
+                                                                  loss_normalizing_factor=loss_normalizing_factor)
+
+    # Extract MoE losses.
+    diversity_metrics = _extract_diversity_metrics(state)
+    aux_loss = aux_loss_factor * diversity_metrics['auxiliary_loss'].mean()
+
+    # Add auxiliary loss to total loss.
+    total_loss += aux_loss
+
+    # segment ids to compute packing, padding etc.
+    segment_ids = {k[:-len('_segment_ids')]: v for k, v in batch.items() if k.endswith('_segment_ids')}
+    # If these don't exist then we can create only padding mask.
+    if not segment_ids:
+        segment_ids = {k: v != 0 for k, v in batch.items() if k in ('encoder_input_tokens', 'decoder_target_tokens')}
+
+    metrics = compute_base_metrics(logits=logits,
+                                   targets=targets,
+                                   mask=weights,
+                                   loss=total_loss,
+                                   z_loss=z_loss,
+                                   segment_ids=segment_ids)
+
+    metrics.update(
+        _expert_metrics(diversity_metrics,
+                        total_loss,
+                        z_loss,
+                        aux_loss,
+                        num_tokens=targets.size))
+
+    return total_loss, metrics
+
+
+def _extract_diversity_metrics(state: flax_scope.FrozenVariableDict) -> Dict[str, jnp.ndarray]:
+    """Extract average expert diversity metrics from sown state intermediates.
+
+  Args:
+    state: Model state holding sown intermediate metrics.
+
+  Returns:
+    Diversity metrics, averaged across MoE layers.
+
+  Raises:
+    ValueError if unable to extract diversity metrics from model state.
+  """
+    state_dict = traverse_util.flatten_dict(flax_core.unfreeze(state))
+
+    avg_metrics = {}
+    for metric in MOE_METRICS:
+        summed_metric = 0.
+        count = 0
+        for path, value in state_dict.items():
+            if path[-1] == metric:
+                summed_metric += jnp.asarray(value, dtype=jnp.float32)
+                count += 1
+
+        if count == 0:
+            raise ValueError(f'Unable to find expert metric: {metric}. Please check that MoE '
+                             'metrics and losses are correctly sown.')
+        avg_metrics[metric] = summed_metric / count
+
+    return avg_metrics
+
+
+def _expert_metrics(diversity_metrics: Mapping[str, jnp.ndarray], total_loss: float, z_loss: float,
+                    auxiliary_loss: float, num_tokens: int) -> MetricsMap:
+    """Summarizes per-layer expert metrics for the entire model.
+
+  The return metrics map will also contain overrides for the cross entropy loss
+  metrics to account for the MoE losses.
+
+  Args:
+    diversity_metrics: Per-layer mixture of expert metrics.
+    total_loss: Total model loss.
+    z_loss: Output logits z-loss (not MoE specific).
+    auxiliary_loss: Auxiliary load balancing loss for MoE models.
+    num_tokens: Total number of target tokens.
+
+  Returns:
+    Expert diversity metrics.
+  """
+    cross_ent_loss = total_loss - z_loss - auxiliary_loss
+    return {
+        'experts/auxiliary_loss': metrics_lib.AveragePerStep.from_model_output(auxiliary_loss),
+        # Override vanilla T5 cross entropy loss metrics with corrected loss that
+        # accounts for MoE losses.
+        'cross_ent_loss': metrics_lib.AveragePerStep(total=cross_ent_loss),
+        'cross_ent_loss_per_all_target_tokens': clu_metrics.Average(total=jnp.sum(cross_ent_loss), count=num_tokens)
+    }
