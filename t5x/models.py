@@ -1439,9 +1439,7 @@ class MoeEncoderDecoderModel(EncoderDecoderModel):
         label_smoothing: float = 0.0,
         z_loss: float = 0.0,
         loss_normalizing_factor: Optional[float] = None,
-        aux_loss_factor: float = 0.,
-        task_id_loss_factor: float = 0.,
-        CR_loss_factor: float = 0.,
+        aux_loss_factor: float = 0.0,
     ):
         super().__init__(module=module,
                          input_vocabulary=input_vocabulary,
@@ -1452,15 +1450,13 @@ class MoeEncoderDecoderModel(EncoderDecoderModel):
                          label_smoothing=label_smoothing,
                          z_loss=z_loss,
                          loss_normalizing_factor=loss_normalizing_factor)
+        
         self._aux_loss_factor = aux_loss_factor
-        self._task_id_loss_factor = task_id_loss_factor
-        self._CR_loss_factor = CR_loss_factor
 
     def loss_fn(
         self,
         params: PyTreeDef,
         batch: Mapping[str, jnp.ndarray],
-        step_number: int,
         dropout_rng: Optional[jnp.ndarray],
     ) -> Tuple[jnp.ndarray, MetricsMap]:
         """Cross-entropy loss function with auxiliary MoE losses.
@@ -1475,16 +1471,15 @@ class MoeEncoderDecoderModel(EncoderDecoderModel):
       - Metrics.
     """
 
-        logits, state = self._compute_logits(params, batch, step_number, dropout_rng, mutable=['intermediates'])
+        logits, state = self._compute_logits(params, batch, dropout_rng, mutable=['intermediates'])
 
         return _moe_loss_fn(batch, logits, state, self._label_smoothing, self._z_loss, self._loss_normalizing_factor,
-                            self._aux_loss_factor, self._task_id_loss_factor, self._CR_loss_factor)
+                            self._aux_loss_factor)
 
 
 def _moe_loss_fn(batch: Mapping[str, jnp.ndarray], logits: jnp.ndarray, state: flax_scope.FrozenVariableDict,
                  label_smoothing: float, z_loss: float, loss_normalizing_factor: Optional[float],
-                 aux_loss_factor: float, task_id_loss_factor: float,
-                 CR_loss_factor: float) -> Tuple[jnp.ndarray, MetricsMap]:
+                 aux_loss_factor: float) -> Tuple[jnp.ndarray, MetricsMap]:
     """Computes combined cross-entropy and MoE auxiliary loss."""
     loss_normalizing_factor: Optional[Union[float, int, str, losses.SpecialLossNormalizingFactor]]
     (loss_normalizing_factor, weights) = losses.get_loss_normalizing_factor_and_weights(loss_normalizing_factor, batch)
