@@ -413,6 +413,10 @@ if __name__ == '__main__':
       'bucket. Note that this flag overrides the `tfds_data_dir` attribute of '
       'all `Task`s.')
 
+  flags.DEFINE_list(
+      'seqio_additional_cache_dirs', [],
+      'Directories to search for cached Tasks in addition to defaults.')
+
 
   def main(argv: Sequence[str]):
     """Wrapper for pdb post mortems."""
@@ -425,6 +429,8 @@ if __name__ == '__main__':
 
     if FLAGS.tfds_data_dir:
       seqio.set_tfds_data_dir_override(FLAGS.tfds_data_dir)
+    
+    seqio.add_global_cache_dirs(FLAGS.seqio_additional_cache_dirs)
 
     if config_utils.using_fdl():
       config = config_utils.config_with_fiddle(evaluate)
